@@ -1,7 +1,7 @@
 -- CoinClicker Hub
+-- FUNC FIX: input adaptativo + loop leve; firesignal opcional, não obrigatório.
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local SoundService = game:GetService("SoundService")
@@ -299,25 +299,209 @@ local function isCoinClickerMenuOpen(now)
 end
 
 
-local function press(button)
+--==================================================
+-- INPUT COMPAT - POTASSIUM / XENO / FALLBACK
+-- Ordem:
+-- 1) firesignal, quando existir;
+-- 2) VirtualInputManager via serviço;
+-- 3) VirtualInputManager via Instance.new (compat com executores que expõem assim);
+-- 4) VirtualUser;
+-- 5) GuiButton:Activate().
+--==================================================
+local VirtualUser = nil
+
+pcall(function()
+    VirtualUser = game:GetService("VirtualUser")
+end)
+
+local function getVirtualInputManager()
+    local vim = nil
+    local created = false
+
+    pcall(function()
+        vim = game:GetService("VirtualInputManager")
+    end)
+
+    if not vim then
+        pcall(function()
+            vim = Instance.new("VirtualInputManager")
+            created = true
+        end)
+    end
+
+    return vim, created
+end
+
+local function setHiddenAncestorsVisible(button)
+    local changed = {}
+    local parent = button
+
+    while parent and parent ~= playerGui do
+        if parent:IsA("GuiObject") and not parent.Visible then
+            table.insert(changed, {
+                object = parent,
+                visible = parent.Visible,
+            })
+            parent.Visible = true
+        end
+
+        parent = parent.Parent
+    end
+
+    return changed
+end
+
+local function restoreHiddenAncestors(changed)
+    for i = #changed, 1, -1 do
+        local item = changed[i]
+
+        if item.object and item.object.Parent then
+            item.object.Visible = item.visible
+        end
+    end
+end
+
+local function getButtonCenter(button)
+    local size = button.AbsoluteSize
+    local pos = button.AbsolutePosition
+
+    if size.X <= 2 or size.Y <= 2 then
+        return nil
+    end
+
+    return math.floor(pos.X + size.X * 0.5),
+        math.floor(pos.Y + size.Y * 0.5)
+end
+
+local function clickWithVirtualInput(button)
+    local x, y = getButtonCenter(button)
+    if not x then
+        return false
+    end
+
+    local vim, created = getVirtualInputManager()
+    if not vim then
+        return false
+    end
+
+    local ok = pcall(function()
+        vim:SendMouseMoveEvent(x, y, game)
+        task.wait(0.01)
+        vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.025)
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+
+    if created and vim then
+        pcall(function()
+            vim:Destroy()
+        end)
+    end
+
+    return ok
+end
+
+local function clickWithVirtualUser(button)
+    if not VirtualUser then
+        return false
+    end
+
+    local x, y = getButtonCenter(button)
+    if not x then
+        return false
+    end
+
+    local point = Vector2.new(x, y)
+    local camera = workspace.CurrentCamera
+    local cameraCFrame = camera and camera.CFrame or CFrame.new()
+
+    local ok = pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton1(point, cameraCFrame)
+    end)
+
+    if ok then
+        return true
+    end
+
+    return pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(point, cameraCFrame)
+        task.wait(0.025)
+        VirtualUser:Button1Up(point, cameraCFrame)
+    end)
+end
+
+local function compatActivate(button, allowHidden)
     if not button
         or not button:IsA("GuiButton")
-        or not visible(button)
-        or not button.Active
+        or not button.Parent
     then
         return false
     end
 
-    if type(firesignal) == "function" then
-        -- Activated funciona para mouse, toque e gamepad.
-        return pcall(function()
-            firesignal(button.Activated)
-        end)
+    local changed = {}
+
+    if allowHidden then
+        changed = setHiddenAncestorsVisible(button)
+        task.wait(0.02)
+    elseif not visible(button) then
+        return false
     end
 
-    return pcall(function()
+    -- Mantém compatibilidade com executores completos sem tornar isso obrigatório.
+    if type(firesignal) == "function" then
+        local ok = pcall(function()
+            firesignal(button.Activated)
+        end)
+
+        restoreHiddenAncestors(changed)
+
+        if ok then
+            return true
+        end
+    end
+
+    -- Xeno e similares podem expor VirtualInputManager de formas diferentes.
+    if clickWithVirtualInput(button) then
+        restoreHiddenAncestors(changed)
+        return true
+    end
+
+    if clickWithVirtualUser(button) then
+        restoreHiddenAncestors(changed)
+        return true
+    end
+
+    -- Último fallback, totalmente padrão.
+    local oldActive = button.Active
+
+    if not oldActive then
+        button.Active = true
+    end
+
+    local ok = pcall(function()
         button:Activate()
     end)
+
+    if button and button.Parent then
+        button.Active = oldActive
+    end
+
+    restoreHiddenAncestors(changed)
+
+    return ok
+end
+
+local function press(button)
+    if not button
+        or not button:IsA("GuiButton")
+        or not visible(button)
+    then
+        return false
+    end
+
+    return compatActivate(button, false)
 end
 
 local function findFrame(name)
@@ -411,17 +595,8 @@ local function activateNativeButton(button)
         return false
     end
 
-    -- Usado só para controles do próprio CoinClicker que ficam escondidos
-    -- no Compact View. Não depende da visibilidade do ancestral.
-    if type(firesignal) == "function" then
-        return pcall(function()
-            firesignal(button.Activated)
-        end)
-    end
-
-    return pcall(function()
-        button:Activate()
-    end)
+    -- Fortunes pode estar dentro de uma coluna escondida no Compact View.
+    return compatActivate(button, true)
 end
 
 local function openNativeFortunes()
@@ -645,9 +820,8 @@ local function popWrinklers()
             and size.Y >= 20
             and not SeenWrinklers[button]
         then
-            SeenWrinklers[button] = true
-
             if press(button) then
+                SeenWrinklers[button] = true
                 return 1
             end
         end
@@ -664,9 +838,8 @@ local function clickGoldens()
 
     for _, button in ipairs(allButtons(goldens)) do
         if not SeenGoldens[button] then
-            SeenGoldens[button] = true
-
             if press(button) then
+                SeenGoldens[button] = true
                 return 1
             end
         end
@@ -1861,17 +2034,9 @@ end
 -- Só aparece no personagem do LocalPlayer.
 --==================================================
 local LHubTagName = "LHubLocalTag"
-local LHubTagTweens = {}
 local LHubCharacterConnection = nil
 
 local function clearLHubTag()
-    for _, tw in ipairs(LHubTagTweens) do
-        pcall(function()
-            tw:Cancel()
-        end)
-    end
-    table.clear(LHubTagTweens)
-
     local oldTag = playerGui:FindFirstChild(LHubTagName)
     if oldTag then
         oldTag:Destroy()
@@ -2022,10 +2187,6 @@ local function createLHubTag(character)
                 }
             )
 
-            table.insert(LHubTagTweens, nameTween)
-            table.insert(LHubTagTweens, hubTween)
-            table.insert(LHubTagTweens, borderTween)
-
             nameTween:Play()
             hubTween:Play()
             borderTween:Play()
@@ -2044,96 +2205,128 @@ if player.Character then
     task.defer(createLHubTag, player.Character)
 end
 
-local connection
-connection = RunService.Heartbeat:Connect(function()
-    if not State.Running then
-        return
-    end
+local AutomationLoopRunning = true
+local AutomationLoopInterval = 0.05
 
-    local now = os.clock()
-    local menuOpen = isCoinClickerMenuOpen(now)
+task.spawn(function()
+    while State.Running and AutomationLoopRunning do
+        local now = os.clock()
+        local menuOpen = isCoinClickerMenuOpen(now)
 
-    safetyCheck(now)
-    setActivity(menuOpen)
-    handleMenuTransition(menuOpen, now)
+        safetyCheck(now)
+        setActivity(menuOpen)
+        handleMenuTransition(menuOpen, now)
 
-    if not menuOpen then
-        return
-    end
+        -- IMPORTANTE:
+        -- Não usamos "return" quando o menu fecha ou a proteção pausa.
+        -- "return" encerrava o loop inteiro e nenhuma automação voltava a funcionar.
+        if menuOpen and not Safety.Paused then
+            if State.CompactView
+                and compactReapplyAt > 0
+                and now >= compactReapplyAt
+            then
+                compactReapplyAt = 0
+                pcall(applyCompact)
+            end
 
-    if Safety.Paused then
-        return
-    end
+            if State.AutoItems
+                and now - State.LastItems >= State.ItemInterval
+            then
+                State.LastItems = now
 
-    if State.CompactView and compactReapplyAt > 0 and now >= compactReapplyAt then
-        compactReapplyAt = 0
-        pcall(applyCompact)
-    end
+                local bought = buyBestGenerator()
 
-    if State.AutoItems and now - State.LastItems >= State.ItemInterval then
-        State.LastItems = now
-
-        local bought = buyBestGenerator()
-
-        -- Se nada estiver comprável, só verifica de novo depois.
-        if not bought then
-            State.LastItems = now + 0.75
-        end
-    end
-
-    if State.AutoBuff and now - State.LastBuff >= State.BuffInterval then
-        State.LastBuff = now
-        buyAvailableUpgrade()
-    end
-
-    if State.AutoWrinkler and now - State.LastWrinkler >= State.WrinklerInterval then
-        State.LastWrinkler = now
-        popWrinklers()
-    end
-
-    if State.AutoGolden and now - State.LastGolden >= State.GoldenInterval then
-        State.LastGolden = now
-        clickGoldens()
-    end
-
-    if State.AutoBlackMarket
-        and now - State.LastBlackMarket >= State.BlackMarketInterval
-    then
-        State.LastBlackMarket = now
-        stepBlackMarket(now)
-    end
-if State.CompactView and now - State.LastCompact >= 1.25 then
-        State.LastCompact = now
-
-        -- Só mantém o posicionamento/visibilidade em sincronia.
-        -- O layout pesado é reaplicado somente quando necessário.
-        if CompactFortunesButton and CompactFortunesButton.Visible then
-            local left = getFrame("LeftColumn")
-
-            if left then
-                local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-                local buttonHeight = CompactFortunesButton.AbsoluteSize.Y > 0
-                    and CompactFortunesButton.AbsoluteSize.Y
-                    or (isMobile and 38 or 36)
-
-                local availableWidth = math.max(130, math.floor(left.AbsoluteSize.X - 12))
-                local buttonWidth = math.min(isMobile and 210 or 196, availableWidth)
-
-                local x = math.floor(
-                    left.AbsolutePosition.X
-                    + (left.AbsoluteSize.X - buttonWidth) / 2
-                )
-
-                local y = math.floor(left.AbsolutePosition.Y + left.AbsoluteSize.Y + 6)
-
-                if viewport then
-                    y = math.min(y, viewport.Y - buttonHeight - 12)
+                if not bought then
+                    State.LastItems = now + 0.75
                 end
+            end
 
-                CompactFortunesButton.Size = UDim2.fromOffset(buttonWidth, buttonHeight)
-                CompactFortunesButton.Position = UDim2.fromOffset(x, y)
+            if State.AutoBuff
+                and now - State.LastBuff >= State.BuffInterval
+            then
+                State.LastBuff = now
+                buyAvailableUpgrade()
+            end
+
+            if State.AutoWrinkler
+                and now - State.LastWrinkler >= State.WrinklerInterval
+            then
+                State.LastWrinkler = now
+                popWrinklers()
+            end
+
+            if State.AutoGolden
+                and now - State.LastGolden >= State.GoldenInterval
+            then
+                State.LastGolden = now
+                clickGoldens()
+            end
+
+            if State.AutoBlackMarket
+                and now - State.LastBlackMarket >= State.BlackMarketInterval
+            then
+                State.LastBlackMarket = now
+                stepBlackMarket(now)
+            end
+
+            if State.CompactView
+                and now - State.LastCompact >= 1.25
+            then
+                State.LastCompact = now
+
+                if CompactFortunesButton
+                    and CompactFortunesButton.Visible
+                then
+                    local left = getFrame("LeftColumn")
+
+                    if left then
+                        local camera = workspace.CurrentCamera
+                        local viewport = camera and camera.ViewportSize
+
+                        local buttonHeight =
+                            CompactFortunesButton.AbsoluteSize.Y > 0
+                            and CompactFortunesButton.AbsoluteSize.Y
+                            or (isMobile and 38 or 36)
+
+                        local availableWidth = math.max(
+                            130,
+                            math.floor(left.AbsoluteSize.X - 12)
+                        )
+
+                        local buttonWidth = math.min(
+                            isMobile and 210 or 196,
+                            availableWidth
+                        )
+
+                        local x = math.floor(
+                            left.AbsolutePosition.X
+                            + (left.AbsoluteSize.X - buttonWidth) / 2
+                        )
+
+                        local y = math.floor(
+                            left.AbsolutePosition.Y
+                            + left.AbsoluteSize.Y
+                            + 6
+                        )
+
+                        if viewport then
+                            y = math.min(
+                                y,
+                                viewport.Y - buttonHeight - 12
+                            )
+                        end
+
+                        CompactFortunesButton.Size =
+                            UDim2.fromOffset(buttonWidth, buttonHeight)
+
+                        CompactFortunesButton.Position =
+                            UDim2.fromOffset(x, y)
+                    end
+                end
             end
         end
+
+        task.wait(AutomationLoopInterval)
     end
 end)
 
@@ -2209,9 +2402,7 @@ local function stop()
         CompactFortunesButton.Visible = false
     end
 
-    if connection then
-        connection:Disconnect()
-    end
+    AutomationLoopRunning = false
 
     if Gui then
         Gui:Destroy()
